@@ -1,0 +1,35 @@
+[package]
+name = "clipboard-manager"
+version = "0.1.0"
+description = "Cross-platform clipboard history"
+authors = ["Nayan Biswas"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.23.1"
+clipboard-rs = "0.3.5"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-global-shortcut = "2.4.0"
+tauri-plugin-single-instance = "2.5.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.7.0", default-features = false }
+gtk = "0.18.2"
