@@ -1,0 +1,199 @@
+# Builds installers for Linux (.deb, .rpm, AppImage, AUR recipe) and Windows (.msi, -setup.exe)
+# and attaches them to a draft GitHub Release. Started by hand from the Actions tab.
+# Steps to cut a release: docs/setup.md.
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One run at a time, so runs don't fight over the same draft.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Creates the draft release once, so the build jobs don't race to create it.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check version and create draft release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -r .version package.json)
+          tag="v$version"
+          # Windows .msi only accepts plain numbers.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::package.json version '$version' must be numbers only, like 1.2.3"
+            exit 1
+          fi
+          # Drafts have no tag yet, so a tag means this version is already published.
+          existing=$(git ls-remote --tags origin "refs/tags/$tag")
+          if [[ -n "$existing" ]]; then
+            echo "::error::$tag is already released. Bump the version first: npm version patch --no-git-tag-version"
+            exit 1
+          fi
+
+          # A draft from an earlier failed run of the same version is replaced.
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                        --jq ".[] | select(.draft and .tag_name == \"$tag\") | .id"); do
+            echo "Deleting old draft $id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+
+          cat > notes.md <<'EOF'
+          ## Download
+
+          | System | File |
+          |---|---|
+          | Ubuntu, Debian, Mint, Pop!_OS | `.deb` |
+          | Fedora, RHEL, Rocky, Alma, openSUSE | `.rpm` |
+          | Arch, Manjaro, EndeavourOS | `.AppImage`, or AUR `clipboardmanager-bin` (updated shortly after each release) |
+          | Other Linux | `.AppImage` |
+          | Windows 10/11 | `-setup.exe` (or `.msi`) |
+
+          **Windows:** the installer is unsigned. If SmartScreen blocks it, click **More info → Run anyway**.
+
+          **AppImage:** needs FUSE 2 (`sudo pacman -S fuse2` on Arch). If the window is blank,
+          start it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
+          EOF
+
+          # The tag is created when you publish; target_commitish pins it to this commit.
+          id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+                 -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
+                 -f name="ClipboardManager $tag" -F body=@notes.md -F draft=true \
+                 --jq .id)
+          [[ -n "$id" ]] || { echo "::error::Creating the draft release returned no id"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 has an older glibc, so the packages also run on newer distros.
+          - name: linux
+            os: ubuntu-22.04
+            args: --bundles deb,rpm,appimage
+          - name: windows
+            os: windows-latest
+            args: ""
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux build packages
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - run: npm ci
+      - run: npm test
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build and upload installers
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          args: ${{ matrix.args }}
+
+      # The aur job needs the .deb; draft release files are awkward to download.
+      - name: Keep .deb for the AUR job
+        if: matrix.name == 'linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+          retention-days: 1
+          overwrite: true # "Re-run all jobs" uploads it again
+
+  # Fills in the AUR recipe, test-builds it on Arch, and attaches it to the draft.
+  # Pushing to AUR is manual.
+  aur:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: deb
+          path: aur
+
+      - name: Fill in PKGBUILD
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          deb="ClipboardManager_${VERSION}_amd64.deb"
+          [[ -f "aur/$deb" ]] || { echo "::error::Expected aur/$deb, found: $(ls aur)"; exit 1; }
+          sum=$(sha256sum "aur/$deb" | cut -d' ' -f1)
+          sed -e "s/^pkgver=.*/pkgver=$VERSION/" \
+              -e "s/^sha256sums=.*/sha256sums=('$sum')/" \
+              packaging/aur/PKGBUILD > aur/PKGBUILD
+
+      # Catches a wrong checksum or a broken package() before you push to AUR.
+      - name: Make .SRCINFO and test-build on Arch
+        run: |
+          docker run --rm -v "$PWD/aur:/pkg" archlinux:latest bash -euo pipefail -c '
+            pacman -Syu --noconfirm --needed base-devel >/dev/null
+            useradd -m builder
+            chown -R builder /pkg
+            # makepkg uses the local .deb instead of downloading it.
+            su builder -c "cd /pkg && makepkg --printsrcinfo > .SRCINFO && makepkg --nodeps --noconfirm"
+          '
+          sudo chown -R "$(id -u):$(id -g)" aur
+          cat aur/.SRCINFO
+
+      - name: Upload AUR files to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          # GitHub renames files that start with a dot, so ship both files in one archive.
+          archive="aur-clipboardmanager-bin-$VERSION.tar.gz"
+          tar -czf "$archive" -C aur PKGBUILD .SRCINFO
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/gzip" \
+            --data-binary "@$archive" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$archive" \
+            -o /dev/null

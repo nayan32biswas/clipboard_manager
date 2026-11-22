@@ -1,0 +1,21 @@
+# Template. CI (release.yml, job "aur") fills in pkgver and sha256sums; don't edit them by hand.
+pkgname=clipboardmanager-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Clipboard history manager"
+arch=('x86_64')
+url="https://github.com/nayan32biswas/clipboard_manager"
+# No LICENSE file yet; update when one is added.
+license=('unknown')
+# Matches the .deb's Depends. The tray library is loaded at runtime, so ldd doesn't show it.
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator')
+provides=('clipboardmanager')
+conflicts=('clipboardmanager')
+# Repackages the .deb from the GitHub Release, so Arch uses its own webkit2gtk.
+source=("https://github.com/nayan32biswas/clipboard_manager/releases/download/v${pkgver}/ClipboardManager_${pkgver}_amd64.deb")
+sha256sums=('SKIP')
+
+package() {
+  # makepkg already unpacked the .deb into data.tar.* and control.tar.*.
+  bsdtar -xf "$srcdir"/data.tar.* -C "$pkgdir"
+}
